@@ -61,6 +61,7 @@ public class LocalDiskShuffleMapOutputWriter implements ShuffleMapOutputWriter {
   private FileOutputStream outputFileStream;
   private FileChannel outputFileChannel;
   private BufferedOutputStream outputBufferedFileStream;
+  private SparkConf sparkConf;
 
   public LocalDiskShuffleMapOutputWriter(
       int shuffleId,
@@ -68,6 +69,7 @@ public class LocalDiskShuffleMapOutputWriter implements ShuffleMapOutputWriter {
       int numPartitions,
       IndexShuffleBlockResolver blockResolver,
       SparkConf sparkConf) {
+    this.sparkConf = sparkConf;
     this.shuffleId = shuffleId;
     this.mapId = mapId;
     this.blockResolver = blockResolver;
@@ -113,6 +115,7 @@ public class LocalDiskShuffleMapOutputWriter implements ShuffleMapOutputWriter {
     cleanUp();
     File resolvedTmp = outputTempFile != null && outputTempFile.isFile() ? outputTempFile : null;
     blockResolver.writeIndexFileAndCommit(shuffleId, mapId, partitionLengths, resolvedTmp);
+    blockResolver.writeIndexFileAndDataFileToHdfs(shuffleId, mapId, partitionLengths, sparkConf);
     return partitionLengths;
   }
 

@@ -17,20 +17,24 @@
 
 package org.apache.spark.storage
 
-import java.io.{InputStream, IOException}
-import java.nio.channels.ClosedByInterruptException
+import java.io.{DataInputStream, File, IOException, InputStream}
+import java.nio.channels.{Channels, ClosedByInterruptException}
+import java.nio.file.Files
 import java.util.concurrent.{LinkedBlockingQueue, TimeUnit}
+
 import javax.annotation.concurrent.GuardedBy
 
 import scala.collection.mutable
 import scala.collection.mutable.{ArrayBuffer, HashMap, HashSet, LinkedHashMap, Queue}
 import scala.util.{Failure, Success}
-
 import org.apache.commons.io.IOUtils
-
-import org.apache.spark.{SparkException, TaskContext}
+import org.apache.hadoop.fs
+import org.apache.hadoop.fs.Path
+import org.apache.spark.deploy.SparkHadoopUtil
+import org.apache.spark.{SparkEnv, SparkException, TaskContext}
 import org.apache.spark.internal.Logging
 import org.apache.spark.network.buffer.{FileSegmentManagedBuffer, ManagedBuffer}
+import org.apache.spark.network.netty.SparkTransportConf
 import org.apache.spark.network.shuffle._
 import org.apache.spark.network.util.TransportConf
 import org.apache.spark.shuffle.{FetchFailedException, ShuffleReadMetricsReporter}
@@ -262,8 +266,75 @@ final class ShuffleBlockFetcherIterator(
       }
 
       override def onBlockFetchFailure(blockId: String, e: Throwable): Unit = {
-        logError(s"Failed to get block(s) from ${req.address.host}:${req.address.port}", e)
-        results.put(new FailureFetchResult(BlockId(blockId), infoMap(blockId)._2, address, e))
+
+        val (shuffleId, mapId, startReduceId, endReduceId) = BlockId(blockId) match {
+          case id: ShuffleBlockId =>
+            (id.shuffleId, id.mapId, id.reduceId, id.reduceId + 1)
+          case batchId: ShuffleBlockBatchId =>
+            (batchId.shuffleId, batchId.mapId, batchId.startReduceId, batchId.endReduceId)
+          case _ =>
+            throw new IllegalArgumentException("unexpected shuffle block id format: " + blockId)
+        }
+          val sparkConf = SparkEnv.get.conf
+          val sparkAppId = sparkConf.getAppId
+          val shuffleDataDownloadDir = sparkConf.get("spark.shuffle.data.download.dir")
+          val shuffleDataDownloadDestDir = sparkConf.get("spark.shuffle.data.download.dest.dir")
+          val configuration = SparkHadoopUtil.get.newConfiguration(sparkConf)
+          val fileSystem = fs.FileSystem.get(configuration)
+          val fileName = (shuffleId: Int,mapId: Long, isData:Boolean) => {
+            if (isData)
+              "shuffle_"+shuffleId+"_"+mapId+"_0.data"
+            else
+              "shuffle_"+shuffleId+"_"+mapId+"_0.index"
+          }
+          def copyToLocalFile(mapShuffleName:String) = {
+
+            val srcPath = shuffleDataDownloadDir+ "/" + sparkAppId +"/" + req.address.host + "/" + mapShuffleName
+            val destPath = shuffleDataDownloadDestDir+"/" + sparkAppId + "/" + mapShuffleName
+            try {
+              fileSystem.copyFromLocalFile(new Path(srcPath), new Path(destPath))
+            }catch {
+              case e:IOException =>
+                logError(s"Failed to download hdfs file(${srcPath})",e)
+            }
+            new File(destPath)
+          }
+          val index = copyToLocalFile(fileName(shuffleId,mapId, false))
+          val data = copyToLocalFile(fileName(shuffleId,mapId,true))
+          if (index.exists() && data.exists()){
+            // todo
+            val channel = Files.newByteChannel(index.toPath)
+            channel.position(startReduceId * 8L)
+            val in = new DataInputStream(Channels.newInputStream(channel))
+            try {
+              val startOffset = in.readLong()
+              channel.position(endReduceId * 8L)
+              val endOffset = in.readLong()
+              val actualPosition = channel.position()
+              val expectedPosition = endReduceId * 8L + 8
+              if (actualPosition != expectedPosition) {
+                throw new Exception(s"SPARK-22982: Incorrect channel position after index file reads: " +
+                  s"expected $expectedPosition but actual position was $actualPosition.")
+              }
+              val fileSegmentManagedBuffer = new FileSegmentManagedBuffer(
+                SparkTransportConf.fromSparkConf(sparkConf, "shuffle"),
+                data,
+                startOffset,
+                endOffset - startOffset)
+              if ( fileSegmentManagedBuffer != null && fileSegmentManagedBuffer.size() != 0){
+                results.put(new SuccessFetchResult(BlockId(blockId), infoMap(blockId)._2,
+                  address, infoMap(blockId)._1, fileSegmentManagedBuffer, remainingBlocks.isEmpty))
+              }else{
+                logError(s"Failed to get block(s) from ${req.address.host}:${req.address.port}", e)
+                results.put(new FailureFetchResult(BlockId(blockId), infoMap(blockId)._2, address, e))
+              }
+            } finally {
+              in.close()
+            }
+          }else{
+            logError(s"Failed to get block(s) from ${req.address.host}:${req.address.port}", e)
+            results.put(new FailureFetchResult(BlockId(blockId), infoMap(blockId)._2, address, e))
+          }
       }
     }
 

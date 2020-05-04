@@ -19,9 +19,15 @@ package org.apache.spark.shuffle
 
 import java.io._
 import java.nio.channels.Channels
+import java.nio.file
 import java.nio.file.Files
 
-import org.apache.spark.{SparkConf, SparkEnv}
+import org.apache.hadoop.conf.Configuration
+import org.apache.hadoop.fs
+import org.apache.hadoop.fs.Path
+import org.apache.hadoop.hdfs.client.HdfsUtils
+import org.apache.spark.deploy.SparkHadoopUtil
+import org.apache.spark.{SparkConf, SparkContext, SparkEnv}
 import org.apache.spark.internal.Logging
 import org.apache.spark.io.NioBufferedFileInputStream
 import org.apache.spark.network.buffer.{FileSegmentManagedBuffer, ManagedBuffer}
@@ -211,6 +217,43 @@ private[spark] class IndexShuffleBlockResolver(
     } finally {
       if (indexTmp.exists() && !indexTmp.delete()) {
         logError(s"Failed to delete temporary index file at ${indexTmp.getAbsolutePath}")
+      }
+    }
+  }
+  def writeIndexFileAndDataFileToHdfs(
+      shuffleId: Int,
+      mapId: Long,
+      lengths: Array[Long],
+      sparkConf: SparkConf): Unit ={
+    val indexFile = getIndexFile(shuffleId, mapId)
+    val dataFile = getDataFile(shuffleId, mapId)
+    synchronized{
+      val existingLengths = checkIndexAndDataFile(indexFile, dataFile, lengths.length)
+      if (existingLengths != null) {
+
+        val configuration = SparkHadoopUtil.get.newConfiguration(sparkConf)
+        val fileSystem = fs.FileSystem.get(configuration)
+        val shuffleDataDir = sparkConf.get("spark.shuffle.data.download.dir")
+        val sparkAppId = sparkConf.getAppId
+        val hostName = blockManager.blockManagerId.host
+        def copyFromLocalFile(file: File) = {
+          val srcPath = new Path(file.getPath)
+          val destPath = new Path(shuffleDataDir + "/" + sparkAppId + "/" + hostName + "_" + file.getName)
+          try {
+            fileSystem.copyFromLocalFile(srcPath, destPath)
+          }catch {
+            case e:IOException =>
+              logError(s"Failed to copy from local file(${srcPath.getName}) to hdfs file(${destPath.getName})",e)
+          }
+        }
+
+        copyFromLocalFile(indexFile)
+        copyFromLocalFile(dataFile)
+      }else{
+        if (indexFile.exists())
+          indexFile.delete()
+        if (dataFile.exists())
+          dataFile.delete()
       }
     }
   }
